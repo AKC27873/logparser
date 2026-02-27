@@ -46,3 +46,9 @@ structure looks like this:
   ]
 }
 ```
+
+## Expected output
+
+![Alt text](~/Pictures/command.pngraw=true)
+![Alt text](~/Pictures/ls.png?raw=true)
+![Alt text](~/Pictures/output.png.png?raw=true)
