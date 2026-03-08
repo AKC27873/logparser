@@ -4,7 +4,8 @@ logparser.py — Linux Log Parser
 Parses common Linux log files and outputs structured JSON.
 
 Usage:
-    python logparser.py                  # interactive mode (prompts for input/output)
+    # interactive mode (prompts for input/output)
+    python logparser.py
     python logparser.py --help           # show help menu
     python logparser.py -i <file>        # specify input file
     python logparser.py -i <file> -o <file>  # specify input and output file
@@ -387,13 +388,13 @@ class ApacheLogParser(BaseParser):
 
     def parse(self, file: IO[str], file_path: str) -> ParseResult:
         error_mode = _is_error_log(file_path)
-        log_type   = "apache-error.log" if error_mode else "apache-access.log"
-        result     = make_result(file_path, log_type)
+        log_type = "apache-error.log" if error_mode else "apache-access.log"
+        result = make_result(file_path, log_type)
 
         for line_number, raw_line in enumerate(file, start=1):
-            line             = raw_line.rstrip("\n")
-            entry            = make_entry(line_number, line)
-            entry["process"] = "apache"
+            line = raw_line.rstrip("\n")
+            entry = make_entry(line_number, line)
+           entry["process"] = "apache"
 
             if error_mode:
                 m = _APACHE_ERROR_RE.match(line)
@@ -402,18 +403,18 @@ class ApacheLogParser(BaseParser):
                     parts = m.group(2).split(":", 1)
                     if len(parts) == 2:
                         entry["process"] = parts[0]
-                        entry["level"]   = parts[1].upper()
+                        entry["level"] = parts[1].upper()
                     else:
-                        entry["level"]   = m.group(2).upper()
-                    entry["pid"]     = m.group(3)
+                        entry["level"] = m.group(2).upper()
+                    entry["pid"] = m.group(3)
                     entry["message"] = m.group(4)
             else:
                 m = _ACCESS_RE.match(line)
                 if m:
-                    entry["hostname"]  = m.group(1)
+                    entry["hostname"] = m.group(1)
                     entry["timestamp"] = m.group(3)
-                    entry["message"]   = f"{m.group(4)} -> {m.group(5)}"
-                    entry["level"]     = _http_level(m.group(5))
+                    entry["message"] = f"{m.group(4)} -> {m.group(5)}"
+                    entry["level"] = _http_level(m.group(5))
 
             result["entries"].append(clean_entry(entry))
 
@@ -440,13 +441,13 @@ class GenericLogParser(BaseParser):
         result = make_result(file_path, "generic")
 
         for line_number, raw_line in enumerate(file, start=1):
-            line  = raw_line.rstrip("\n")
+            line = raw_line.rstrip("\n")
             entry = make_entry(line_number, line)
 
             m = _ISO_TS_RE.match(line)
             if m:
                 entry["timestamp"] = m.group(1)
-                entry["message"]   = m.group(2)
+                entry["message"] = m.group(2)
 
             entry["level"] = detect_level(entry["message"])
             result["entries"].append(clean_entry(entry))
@@ -499,10 +500,11 @@ def validate_input_file(path: str) -> str:
 
 def validate_output_file(path: str) -> str:
     """Resolve and validate an output file path. Returns the absolute path."""
-    abs_path   = os.path.abspath(path)
+    abs_path = os.path.abspath(path)
     parent_dir = os.path.dirname(abs_path)
     if not os.path.exists(parent_dir):
-        raise FileNotFoundError(f"Output directory does not exist: {parent_dir}")
+        raise FileNotFoundError(
+            f"Output directory does not exist: {parent_dir}")
     if os.path.isdir(abs_path):
         raise ValueError(f"Output path is a directory: {abs_path}")
     return abs_path
@@ -608,21 +610,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
         description="Linux Log Parser — parses log files and outputs JSON",
         add_help=False,   # we print our own help
     )
-    ap.add_argument("-i", "--input",  metavar="<path>", help="Input log file path")
-    ap.add_argument("-o", "--output", metavar="<path>", help="Output JSON file path")
-    ap.add_argument("-h", "--help",   action="store_true", help="Show help and exit")
+    ap.add_argument("-i", "--input",  metavar="<path>",
+                    help="Input log file path")
+    ap.add_argument("-o", "--output", metavar="<path>",
+                    help="Output JSON file path")
+    ap.add_argument("-h", "--help",   action="store_true",
+                    help="Show help and exit")
     return ap
 
 
 def default_output_path(input_path: str) -> str:
     """Derive a sensible default output filename from the input filename."""
-    base    = os.path.basename(input_path)
-    stem    = base if "." not in base else base.rsplit(".", 1)[0]
+    base = os.path.basename(input_path)
+    stem = base if "." not in base else base.rsplit(".", 1)[0]
     return os.path.join(os.getcwd(), f"{stem}_parsed.json")
 
 
 def main() -> None:
-    ap   = build_arg_parser()
+    ap = build_arg_parser()
     args = ap.parse_args()
 
     # ── Help ──────────────────────────────────────────────────────────────────
@@ -674,7 +679,8 @@ def main() -> None:
         print(f"Error reading file: {exc}", file=sys.stderr)
         sys.exit(1)
 
-    result["parsed_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    result["parsed_at"] = datetime.now(
+        timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     json_output = json.dumps(result, indent=2, ensure_ascii=False)
 
