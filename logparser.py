@@ -394,18 +394,18 @@ class ApacheLogParser(BaseParser):
         for line_number, raw_line in enumerate(file, start=1):
             line = raw_line.rstrip("\n")
             entry = make_entry(line_number, line)
-           entry["process"] = "apache"
+        entry["process"] = "apache"
 
-            if error_mode:
-                m = _APACHE_ERROR_RE.match(line)
-                if m:
-                    entry["timestamp"] = m.group(1)
-                    parts = m.group(2).split(":", 1)
-                    if len(parts) == 2:
-                        entry["process"] = parts[0]
-                        entry["level"] = parts[1].upper()
-                    else:
-                        entry["level"] = m.group(2).upper()
+        if error_mode:
+            m = _APACHE_ERROR_RE.match(line)
+            if m:
+                entry["timestamp"] = m.group(1)
+                parts = m.group(2).split(":", 1)
+                if len(parts) == 2:
+                    entry["process"] = parts[0]
+                    entry["level"] = parts[1].upper()
+                else:
+                    entry["level"] = m.group(2).upper()
                     entry["pid"] = m.group(3)
                     entry["message"] = m.group(4)
             else:
