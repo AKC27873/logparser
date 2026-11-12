@@ -25,6 +25,7 @@ import itertools
 import json
 import os
 import re
+import stat
 import sys
 import tempfile
 from abc import ABC, abstractmethod
@@ -33,7 +34,7 @@ from datetime import datetime, timedelta, timezone
 from typing import (IO, Any, Callable, Dict, Iterable, Iterator, List, Optional,
                     Sequence, Tuple, Type)
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1790,23 +1791,125 @@ class _Tee:
             stream.write(text)
 
 
+# what the output gets unless --output-mode says otherwise
+DEFAULT_OUTPUT_MODE = 0o644
+UMASK_MODE = -1                 # sentinel: --output-mode umask
+
+
+def current_umask() -> int:
+    """The process umask, read without the racy umask()-twice dance where possible."""
+    try:
+        with open("/proc/self/status", "r", encoding="ascii", errors="replace") as fh:
+            for line in fh:
+                if line.startswith("Umask:"):
+                    return int(line.split()[1], 8)
+    except (OSError, ValueError, IndexError):
+        pass
+    mask = os.umask(0o022)      # no portable getter; restore it immediately
+    os.umask(mask)
+    return mask
+
+
+def running_as_root() -> bool:
+    return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+def invoking_user() -> Optional[Tuple[int, int]]:
+    """
+    (uid, gid) of the human who ran `sudo`, when we are root because of sudo.
+
+    Files we create as root would otherwise be owned by root and unreadable to
+    them, which is the whole reason this exists.
+    """
+    if not running_as_root():
+        return None
+    raw_uid = os.environ.get("SUDO_UID", "")
+    if not raw_uid.isdigit() or int(raw_uid) == 0:
+        return None
+    uid = int(raw_uid)
+    raw_gid = os.environ.get("SUDO_GID", "")
+    if raw_gid.isdigit():
+        return uid, int(raw_gid)
+    try:
+        import pwd
+        return uid, pwd.getpwuid(uid).pw_gid
+    except (ImportError, KeyError):
+        return uid, -1
+
+
+def resolve_group(name: str) -> int:
+    """Group name or numeric gid → gid."""
+    if name.isdigit():
+        return int(name)
+    try:
+        import grp
+        return grp.getgrnam(name).gr_gid
+    except ImportError:
+        raise ValueError("group names are not supported on this platform")
+    except KeyError:
+        raise ValueError(f"no such group: {name}") from None
+
+
 class OutputTarget:
     """
     Writes to a temp file that replaces the destination only on success,
     so an interrupted run never leaves a half-written output file behind.
+
+    mkstemp() deliberately creates its file 0600, and under sudo that means
+    root-only — so the mode and owner are set explicitly before the rename.
     """
 
-    def __init__(self, path: str, echo: bool = False):
+    def __init__(self, path: str, echo: bool = False, mode: Optional[int] = None,
+                 group: Optional[int] = None,
+                 on_warning: Optional[Callable[[str], None]] = None):
         self.path = path
         self._fh: Optional[IO[str]] = None
         self._tmp: Optional[str] = None
+        self._warn = on_warning or (
+            lambda message: print(message, file=sys.stderr))
         if path == "-":
             self.stream: Any = sys.stdout
             return
         fd, self._tmp = tempfile.mkstemp(prefix=".logparser-", suffix=".tmp",
                                          dir=os.path.dirname(path) or ".")
         self._fh = os.fdopen(fd, "w", encoding="utf-8", newline="")
+        self._apply_permissions(fd, mode, group)
         self.stream = _Tee(self._fh, sys.stdout) if echo else self._fh
+
+    def _apply_permissions(self, fd: int, mode: Optional[int], group: Optional[int]) -> None:
+        """Give the finished file a sane mode and owner instead of mkstemp's root-only 0600."""
+        try:
+            existing: Optional[os.stat_result] = os.stat(self.path)
+        except OSError:
+            existing = None
+
+        if mode is None:
+            mode = DEFAULT_OUTPUT_MODE
+        elif mode == UMASK_MODE:
+            mode = 0o666 & ~current_umask()
+        try:
+            os.fchmod(fd, mode)
+        except OSError as exc:
+            self._warn(f"Warning: could not set mode {
+                       mode:04o} on {self.path}: {exc}")
+
+        uid, gid = -1, -1 if group is None else group
+        owner = invoking_user()
+        if owner:                           # sudo: hand the file to the real user
+            uid = owner[0]
+            if gid == -1:
+                gid = owner[1]
+        elif existing is not None and running_as_root():
+            uid = existing.st_uid           # root rewriting someone else's file
+            if gid == -1:
+                gid = existing.st_gid
+        if (uid, gid) == (-1, -1) or not hasattr(os, "fchown"):
+            return
+        try:
+            os.fchown(fd, uid, gid)
+        except OSError as exc:
+            self._warn(f"Warning: could not change owner of {
+                       self.path}: {exc}")
 
     def commit(self) -> None:
         if self._fh is not None and self._tmp is not None:
@@ -1993,9 +2096,16 @@ OUTPUT
                           Default: ./<input-name>_parsed.<format>
                           (stdout when reading from stdin).
   -f, --format <fmt>      json (default), jsonl, or csv.
+      --output-mode <oct> Permissions for the output file (default 644).
+                          Give an octal mode such as 640, or "umask" to
+                          follow your umask the way a shell redirect does.
+      --output-group <g>  Group that should own the output, e.g. wheel or adm.
       --print             Also echo the output to the terminal.
       --top <n>           Items in each "top" summary list (default 10).
   -q, --quiet             Hide the banner and summary report.
+
+                          Run under sudo, the output is handed back to the user
+                          who invoked sudo, so reading it afterwards needs no root.
 
 FILTERS  (combine freely — an entry must pass all of them)
   -l, --level <level>     Minimum severity: 'warning' keeps WARNING and
@@ -2099,12 +2209,34 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--matched-only", action="store_true")
     ap.add_argument("-n", "--tail", type=_positive_int)
     ap.add_argument("--top", type=_positive_int, default=10)
+    ap.add_argument("--output-mode", type=_file_mode, metavar="<octal>")
+    ap.add_argument("--output-group", type=_group_argument, metavar="<group>")
     ap.add_argument("--print", action="store_true", dest="print_output")
     ap.add_argument("-q", "--quiet", action="store_true")
     ap.add_argument("-h", "--help", action="store_true")
     ap.add_argument("-V", "--version", action="store_true")
     ap.add_argument("--list-types", action="store_true")
     return ap
+
+
+def _file_mode(text: str) -> int:
+    if text.strip().lower() == "umask":
+        return UMASK_MODE
+    try:
+        mode = int(text, 8)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"not an octal file mode: {text}") from None
+    if not 0 <= mode <= 0o7777:
+        raise argparse.ArgumentTypeError(f"file mode out of range: {text}")
+    return mode
+
+
+def _group_argument(text: str) -> int:
+    try:
+        return resolve_group(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
 
 
 def build_filter(args: argparse.Namespace) -> Optional[EntryFilter]:
@@ -2122,6 +2254,23 @@ def build_filter(args: argparse.Namespace) -> Optional[EntryFilter]:
         return None
     return EntryFilter(min_level=args.level, since=args.since, until=args.until, include=include,
                        exclude=exclude, processes=processes, matched_only=args.matched_only)
+
+
+def describe_permissions(path: str) -> str:
+    """e.g. "rw-r--r-- alice:alice" — shown so it's obvious who can read the result."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return "unknown"
+    owner, group = str(st.st_uid), str(st.st_gid)
+    try:
+        import grp
+        import pwd
+        owner = pwd.getpwuid(st.st_uid).pw_name
+        group = grp.getgrgid(st.st_gid).gr_name
+    except (ImportError, KeyError):
+        pass
+    return f"{stat.filemode(st.st_mode)[1:]} {owner}:{group}"
 
 
 def run(args: argparse.Namespace) -> int:
@@ -2178,7 +2327,8 @@ def run(args: argparse.Namespace) -> int:
 
     # ── Parse & write ─────────────────────────────────────────────────────────
     multi = len(inputs) > 1
-    target = OutputTarget(output_path, echo=args.print_output)
+    target = OutputTarget(output_path, echo=args.print_output, mode=args.output_mode,
+                          group=args.output_group, on_warning=lambda m: print(m, file=sys.stderr))
     writer = writer_cls(target.stream, multi=multi)
     combined = Summary()
     current = ""
@@ -2219,7 +2369,8 @@ def run(args: argparse.Namespace) -> int:
     info(combined.render(
         "Summary" if not multi else f"Combined summary ({len(inputs)} files)", top=5))
     if output_path != "-":
-        info(f"\n Done. Results saved to : {output_path}")
+        info(f"\n Done. Results saved to : {
+             output_path}  ({describe_permissions(output_path)})")
     return 0
 
 
