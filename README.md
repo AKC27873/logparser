@@ -47,4 +47,7 @@ structure looks like this:
 }
 ```
 
+## To-Do/Chores 
+-----
 
+- [] Fix the sudo read bug
